@@ -75,6 +75,13 @@ typedef SSL *(*SSL_new_type)(SSL_CTX *ctx);
 typedef void (*SSL_keylog_callback_fn_type)(const SSL *ssl, const char *line);
 typedef void (*SSL_CTX_set_keylog_callback_type)(SSL_CTX *ctx, SSL_keylog_callback_fn_type);
 typedef SSL_keylog_callback_fn_type (*SSL_CTX_get_keylog_callback_type)(const SSL_CTX *ctx);
+#ifndef HAVE_WOLFSSL
+typedef SSL_CTX *(*SSL_get_SSL_CTX_type)(const SSL *ssl);
+typedef void *(*SSL_CTX_get_ex_data_type)(const SSL_CTX *ctx, int idx);
+typedef int (*SSL_CTX_set_ex_data_type)(SSL_CTX *ctx, int idx, void *data);
+typedef int (*CRYPTO_get_ex_new_index_type)(int class_index, long argl, void *argp,
+		CRYPTO_EX_new *new_func, CRYPTO_EX_dup *dup_func, CRYPTO_EX_free *free_func);
+#endif
 typedef int (*SSL_connect_type)(SSL *ssl);
 typedef int (*SSL_do_handshake_type)(SSL *ssl);
 typedef int (*SSL_accept_type)(SSL *ssl);
@@ -129,11 +136,19 @@ extern "C" {
 static SSL_new_type SSL_new_orig;
 static SSL_CTX_set_keylog_callback_type SSL_CTX_set_keylog_callback_orig;
 static SSL_CTX_get_keylog_callback_type SSL_CTX_get_keylog_callback_orig;
-/* Callback already installed on an SSL_CTX before we hijacked it (e.g. kamailio's
- * tls module installs ksr_tls_keylog_callback with its own TUPLE-emitting logic).
- * Global rather than per-CTX because in practice a process has one CTX for the
- * relevant traffic and we do not want to grow ex_data machinery here. */
-static SSL_keylog_callback_fn_type prior_keylog_callback;
+/* The app's own keylog callback (e.g. kamailio's ksr_tls_keylog_callback) is kept
+ * per SSL_CTX in ex_data, so a session from another library's CTX in the same
+ * process (libpq, libcurl) is never handed to it. wolfSSL keeps one global. */
+#ifndef HAVE_WOLFSSL
+static SSL_get_SSL_CTX_type SSL_get_SSL_CTX_orig;
+static SSL_CTX_get_ex_data_type SSL_CTX_get_ex_data_orig;
+static SSL_CTX_set_ex_data_type SSL_CTX_set_ex_data_orig;
+static CRYPTO_get_ex_new_index_type CRYPTO_get_ex_new_index_orig;
+static int app_keylog_callback_idx = -1;
+static pthread_once_t app_keylog_callback_idx_once = PTHREAD_ONCE_INIT;
+#else
+static SSL_keylog_callback_fn_type app_keylog_callback;
+#endif
 static SSL_connect_type SSL_connect_orig;
 static SSL_do_handshake_type SSL_do_handshake_orig;
 static SSL_accept_type SSL_accept_orig;
@@ -519,6 +534,26 @@ static void *write_thread(void *arg) {
 }
 
 static bool write_thread_created;
+/* fork() copies write_thread_created but not the writer thread, nor a key_queue_sync it may
+ * hold, so a child would queue keys forever; the keylog TCP session is the parent's too. */
+static void keylog_atfork_child(void) {
+	write_thread_created = false;
+	key_queue_sync = 0;
+	key_queue_first = NULL;
+	key_queue_last = NULL;
+	#ifdef SSLKEYLOG_TCP
+	if(keylog_tcp_socket) {
+		close(keylog_tcp_socket->getHandle());
+		keylog_tcp_socket = NULL;
+	}
+	#endif
+}
+
+static pthread_once_t keylog_atfork_once = PTHREAD_ONCE_INIT;
+static void register_keylog_atfork(void) {
+	pthread_atfork(NULL, NULL, keylog_atfork_child);
+}
+
 static void create_write_thread() {
 	if(!write_thread_created) {
 		write_thread_created = true;
@@ -528,6 +563,7 @@ static void create_write_thread() {
 }
 
 static void write_keylog_to_queue(const char *key) {
+	pthread_once(&keylog_atfork_once, register_keylog_atfork);
 	_SYNC_LOCK_USLEEP(key_queue_sync, 100);
 	create_write_thread();
 	sKeyQueueItem *kqi = new sKeyQueueItem(key);
@@ -542,17 +578,57 @@ static void write_keylog_to_queue(const char *key) {
 }
 #endif
 
+#ifndef HAVE_WOLFSSL
+/* Allocated on first use, not in setup(): any libcrypto allocation before main() breaks an
+ * application that installs its own allocator (kamailio's CRYPTO_set_mem_functions fails). */
+static void init_app_keylog_callback_idx(void) {
+	if(CRYPTO_get_ex_new_index_orig) {
+		app_keylog_callback_idx = CRYPTO_get_ex_new_index_orig(CRYPTO_EX_INDEX_SSL_CTX, 0, NULL, NULL, NULL, NULL);
+	}
+	if(app_keylog_callback_idx < 0) {
+		debug_printf("FAILED SSL_CTX ex_data index - application keylog callbacks will not be chained");
+	}
+}
+
+static void set_app_keylog_callback(SSL_CTX *ctx, SSL_keylog_callback_fn_type cb) {
+	pthread_once(&app_keylog_callback_idx_once, init_app_keylog_callback_idx);
+	if(ctx && app_keylog_callback_idx >= 0 && SSL_CTX_set_ex_data_orig) {
+		SSL_CTX_set_ex_data_orig(ctx, app_keylog_callback_idx, (void*)cb);
+	}
+}
+
+static SSL_keylog_callback_fn_type get_app_keylog_callback(const SSL *ssl) {
+	pthread_once(&app_keylog_callback_idx_once, init_app_keylog_callback_idx);
+	if(app_keylog_callback_idx < 0 || !SSL_get_SSL_CTX_orig || !SSL_CTX_get_ex_data_orig) {
+		return(NULL);
+	}
+	SSL_CTX *ctx = SSL_get_SSL_CTX_orig(ssl);
+	return(ctx ? (SSL_keylog_callback_fn_type)SSL_CTX_get_ex_data_orig(ctx, app_keylog_callback_idx) : NULL);
+}
+#else
+static void set_app_keylog_callback(SSL_CTX *ctx, SSL_keylog_callback_fn_type cb) {
+	if(cb) {
+		app_keylog_callback = cb;
+	}
+}
+
+static SSL_keylog_callback_fn_type get_app_keylog_callback(const SSL *ssl) {
+	return(app_keylog_callback);
+}
+#endif
+
 static void write_keylog(const SSL *ssl, const char *key) {
 	if(!ssl || !key) {
 		return;
 	}
-	/* Chain to any keylog callback the application installed before us
-	 * (e.g. kamailio's ksr_tls_keylog_callback, which emits "# TUPLE ..."
+	/* Chain to the keylog callback the application installed on this session's
+	 * CTX (e.g. kamailio's ksr_tls_keylog_callback, which emits "# TUPLE ..."
 	 * lines alongside the standard NSS key line). Without this call, the
 	 * app-level callback is silently dropped by our SSL_CTX_set_keylog_callback
 	 * override in SSL_new. */
-	if(prior_keylog_callback) {
-		prior_keylog_callback(ssl, key);
+	SSL_keylog_callback_fn_type app_cb = get_app_keylog_callback(ssl);
+	if(app_cb) {
+		app_cb(ssl, key);
 	}
 	const char *keys_types[] = {
 		"CLIENT_RANDOM ",
@@ -623,21 +699,13 @@ wolfSSL_new
 #endif
 (SSL_CTX *ctx) {
 	if(SSL_CTX_set_keylog_callback_orig) {
-		/* Preserve any callback the application (e.g. kamailio's tls module)
-		 * already installed, so we can chain to it from write_keylog rather
-		 * than silently dropping its output. See prior_keylog_callback.
-		 *
-		 * Re-check on every SSL_new because kamailio uses multiple SSL_CTX
-		 * instances (one for the default TLS domain, plus any per-server-name
-		 * CTX from tls_server_name_cb). Only some of them will carry
-		 * ksr_tls_keylog_callback — grab whichever we see. Overwriting the
-		 * global here is acceptable: we only care that at least one CTX
-		 * points us at the app callback, and any CTX that has it points at
-		 * the same function pointer. */
+		/* Preserve any callback the application already installed on this
+		 * CTX, so write_keylog can chain to it rather than silently dropping
+		 * its output. */
 		if(SSL_CTX_get_keylog_callback_orig) {
 			SSL_keylog_callback_fn_type prev = SSL_CTX_get_keylog_callback_orig(ctx);
 			if(prev && prev != write_keylog) {
-				prior_keylog_callback = prev;
+				set_app_keylog_callback(ctx, prev);
 			}
 		}
 		SSL_CTX_set_keylog_callback_orig(ctx, write_keylog);
@@ -655,8 +723,8 @@ wolfSSL_new
  * callback directly at the call site, then forwards to our own write_keylog
  * on the CTX so both the app callback and the shim run per key line. */
 extern "C" void SSL_CTX_set_keylog_callback(SSL_CTX *ctx, void (*cb)(const SSL *, const char *)) {
-	if(cb && cb != write_keylog) {
-		prior_keylog_callback = cb;
+	if(cb != write_keylog) {
+		set_app_keylog_callback(ctx, cb);
 	}
 	if(SSL_CTX_set_keylog_callback_orig) {
 		SSL_CTX_set_keylog_callback_orig(ctx, write_keylog);
@@ -803,12 +871,18 @@ __attribute__((constructor)) static void setup(void) {
 	if(SSL_CTX_set_keylog_callback_orig) {
 		debug_printf("OK detect pointer to function SSL_CTX_set_keylog_callback : 0x%lx", SSL_CTX_set_keylog_callback_orig);
 	}
-	/* Optional — for chaining to an app-installed callback (see prior_keylog_callback).
+	/* Optional — for chaining to an app-installed callback (see set_app_keylog_callback).
 	 * OpenSSL 1.1.1+ / wolfSSL. Missing on older libs is not fatal; we just cannot chain. */
 	SSL_CTX_get_keylog_callback_orig = (SSL_CTX_get_keylog_callback_type)lookup_symbol("SSL_CTX_get_keylog_callback", LIBSSL_SONAME);
 	if(SSL_CTX_get_keylog_callback_orig) {
 		debug_printf("OK detect pointer to function SSL_CTX_get_keylog_callback : 0x%lx", SSL_CTX_get_keylog_callback_orig);
 	}
+	#ifndef HAVE_WOLFSSL
+	SSL_get_SSL_CTX_orig = (SSL_get_SSL_CTX_type)lookup_symbol("SSL_get_SSL_CTX", LIBSSL_SONAME);
+	SSL_CTX_get_ex_data_orig = (SSL_CTX_get_ex_data_type)lookup_symbol("SSL_CTX_get_ex_data", LIBSSL_SONAME);
+	SSL_CTX_set_ex_data_orig = (SSL_CTX_set_ex_data_type)lookup_symbol("SSL_CTX_set_ex_data", LIBSSL_SONAME);
+	CRYPTO_get_ex_new_index_orig = (CRYPTO_get_ex_new_index_type)lookup_symbol("CRYPTO_get_ex_new_index", LIBSSL_SONAME);
+	#endif
 	#if ONLY_KEYLOG_CALLBACK
 	if(!SSL_CTX_set_keylog_callback_orig) {
 		debug_printf("FAILED detect pointer to function SSL_CTX_set_keylog_callback - exit!");
